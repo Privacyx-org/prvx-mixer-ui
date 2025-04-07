@@ -33,6 +33,13 @@ function App() {
   const [canWithdraw, setCanWithdraw] = useState(false);
   const [withdrawCountdown, setWithdrawCountdown] = useState("");
   const [maxWithdrawable, setMaxWithdrawable] = useState(null);
+  const [windowWidth, setWindowWidth] = useState(window.innerWidth);
+
+  useEffect(() => {
+    const handleResize = () => setWindowWidth(window.innerWidth);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   useEffect(() => {
     if (window.ethereum) {
@@ -192,7 +199,7 @@ function App() {
   return (
     <div style={{
       display: "flex",
-      flexDirection: "row",
+      flexDirection: windowWidth < 768 ? "column" : "row",
       width: "100vw",
       fontFamily: "Arial",
       color: darkMode ? "#fff" : "#000",
@@ -225,20 +232,20 @@ function App() {
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               placeholder="Amount of PRVX"
-              style={{ padding: "0.5rem", marginRight: "1rem" }}
+              style={{ padding: "0.5rem", marginBottom: "1rem", width: "100%", maxWidth: "300px" }}
             />
 
             <div style={{ marginTop: "1rem" }}>
-              <button onClick={approveAndDeposit}>📥 Approve + Deposit</button>
-              <button onClick={withdraw} disabled={!canWithdraw} style={{ marginLeft: "1rem", opacity: canWithdraw ? 1 : 0.5 }} title={!canWithdraw ? withdrawCountdown : "Available"}>
+              <button onClick={approveAndDeposit} style={{ width: "100%", maxWidth: "300px" }}>📥 Approve + Deposit</button>
+              <button onClick={withdraw} disabled={!canWithdraw} style={{ width: "100%", maxWidth: "300px", marginTop: "1rem", opacity: canWithdraw ? 1 : 0.5 }} title={!canWithdraw ? withdrawCountdown : "Available"}>
                 📤 Withdraw
               </button>
-              <button onClick={quickWithdraw} disabled={!canWithdraw} style={{ marginLeft: "1rem", opacity: canWithdraw ? 1 : 0.5 }} title={!canWithdraw ? withdrawCountdown : "Available"}>
+              <button onClick={quickWithdraw} disabled={!canWithdraw} style={{ width: "100%", maxWidth: "300px", marginTop: "1rem", opacity: canWithdraw ? 1 : 0.5 }} title={!canWithdraw ? withdrawCountdown : "Available"}>
                 ⚡ Quick Withdraw
               </button>
             </div>
 
-            <button onClick={defineQuickWithdrawAddress} style={{ marginTop: "1rem" }}>
+            <button onClick={defineQuickWithdrawAddress} style={{ marginTop: "1rem", width: "100%", maxWidth: "300px" }}>
               ⚙️ Set quick withdraw address
             </button>
 
