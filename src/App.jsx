@@ -13,6 +13,7 @@ const prvxAbi = [
 
 const mixerAbi = [
   "event Deposited(address indexed sender, uint256 amount)",
+  "event Withdrawn(address indexed receiver, uint256 amount, uint256 fee)",
   "function deposit(uint256 amount) external",
   "function withdraw(address recipient, uint256 amount) external",
   "function getDeposit(address user) view returns (uint256 amount, uint256 timestamp)"
@@ -31,6 +32,7 @@ function App() {
   const [quickAddress, setQuickAddress] = useState(localStorage.getItem("quickWithdraw"));
   const [canWithdraw, setCanWithdraw] = useState(false);
   const [withdrawCountdown, setWithdrawCountdown] = useState("");
+  const [maxWithdrawable, setMaxWithdrawable] = useState(null);
 
   useEffect(() => {
     if (window.ethereum) {
@@ -60,11 +62,16 @@ function App() {
       setBalance(ethers.formatUnits(bal, 18));
 
       const mixer = new ethers.Contract(MIXER_ADDRESS, mixerAbi, signer);
-      const [_, timestamp] = await mixer.getDeposit(accs[0]);
+      const [rawAmount, timestamp] = await mixer.getDeposit(accs[0]);
+
       if (timestamp > 0n) {
         const time = Number(timestamp);
         const depositDate = new Date(time * 1000);
         setDepositTime(depositDate.toLocaleString());
+
+        const fee = rawAmount * 10n / 10000n;
+        const net = rawAmount - fee;
+        setMaxWithdrawable(ethers.formatUnits(net, 18));
 
         const now = Math.floor(Date.now() / 1000);
         const diff = now - time;
@@ -85,12 +92,24 @@ function App() {
       const parsed = logs.map(log => {
         try {
           const evt = iface.parseLog(log);
-          return {
+          const base = {
             type: evt.name,
-            sender: evt.args.sender,
-            amount: ethers.formatUnits(evt.args.amount, 18),
             tx: log.transactionHash
           };
+          if (evt.name === "Deposited") {
+            return {
+              ...base,
+              sender: evt.args.sender,
+              amount: ethers.formatUnits(evt.args.amount, 18)
+            };
+          } else if (evt.name === "Withdrawn") {
+            return {
+              ...base,
+              receiver: evt.args.receiver,
+              amount: ethers.formatUnits(evt.args.amount + evt.args.fee, 18)
+            };
+          }
+          return null;
         } catch {
           return null;
         }
@@ -180,7 +199,6 @@ function App() {
       background: darkMode ? "#111" : "#f4f4f4",
       minHeight: "100vh"
     }}>
-      {/* Left column */}
       <div style={{ flex: 1, padding: "2rem" }}>
         <div style={{ display: "flex", alignItems: "center", marginBottom: "1rem" }}>
           <img src={logo} alt="PrivacyX Logo" style={{ height: "36px", marginRight: "0.75rem" }} />
@@ -200,6 +218,7 @@ function App() {
             <p>💰 PRVX Balance: {balance}</p>
             {depositTime && <p>🕒 Deposit recorded: {depositTime}</p>}
             {quickAddress && <p>⚡ Quick address: {quickAddress}</p>}
+            {maxWithdrawable && <p>📤 Max withdrawable: {maxWithdrawable} PRVX (after 0.1% fee)</p>}
 
             <input
               type="text"
@@ -226,14 +245,13 @@ function App() {
             <h3 style={{ marginTop: "2rem" }}>📜 History</h3>
             <ul>
               {events.map((e, i) => (
-                <li key={i}>[{e.type}] {e.amount} PRVX - {e.sender.slice(0, 6)}... @ tx {e.tx.slice(0, 10)}</li>
+                <li key={i}>[{e.type}] {e.amount} PRVX - {(e.sender || e.receiver).slice(0, 6)}... @ tx {e.tx.slice(0, 10)}</li>
               ))}
             </ul>
           </>
         )}
       </div>
 
-      {/* Right column with animation */}
       <div style={{
         flex: 1,
         backgroundColor: "#1a1a1a",
@@ -259,7 +277,6 @@ function App() {
           from { transform: rotate(0deg); }
           to { transform: rotate(360deg); }
         }
-
         .logo3d:hover {
           animation-duration: 8s !important;
           transform: scale(1.05);
