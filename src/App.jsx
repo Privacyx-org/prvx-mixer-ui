@@ -26,14 +26,26 @@ function App() {
   const [status, setStatus] = useState("Connect your wallet");
   const [amount, setAmount] = useState("100");
   const [balance, setBalance] = useState("0");
+
   const [depositTime, setDepositTime] = useState(null);
   const [events, setEvents] = useState([]);
   const [darkMode, setDarkMode] = useState(true);
   const [quickAddress, setQuickAddress] = useState(localStorage.getItem("quickWithdraw"));
   const [canWithdraw, setCanWithdraw] = useState(false);
   const [withdrawCountdown, setWithdrawCountdown] = useState("");
-  const [maxWithdrawable, setMaxWithdrawable] = useState(null);
+
+  const [availableGrossStr, setAvailableGrossStr] = useState(null); // balance dispos (brut)
+  const [maxWithdrawable, setMaxWithdrawable] = useState(null);     // net reçu si tu retires tout
   const [windowWidth, setWindowWidth] = useState(window.innerWidth);
+
+  // NEW: verrouillage dépôt tant qu’aucun retrait n’a été fait après le dernier dépôt
+  const [depositLocked, setDepositLocked] = useState(false);
+  const [depositLockMsg, setDepositLockMsg] = useState("");
+
+  // Helpers
+  const toLower = (s) => (typeof s === "string" ? s.toLowerCase() : s);
+  const FEE_NUM = 10n;     // 0.1% = 10 / 10000
+  const FEE_DEN = 10000n;
 
   useEffect(() => {
     const handleResize = () => setWindowWidth(window.innerWidth);
@@ -43,48 +55,142 @@ function App() {
 
   useEffect(() => {
     if (window.ethereum) {
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      setProvider(provider);
+      const p = new ethers.BrowserProvider(window.ethereum);
+      setProvider(p);
     } else {
       setStatus("🦊 Please install MetaMask");
     }
   }, []);
 
+  const loadUserActivity = async (addr, prov) => {
+    try {
+      const iface = new ethers.Interface(mixerAbi);
+
+      // Récupère tous les logs du contrat
+      const logs = await prov.getLogs({
+        address: MIXER_ADDRESS,
+        fromBlock: 0,
+        toBlock: "latest",
+      });
+
+      let myEvents = [];
+      let deposits = 0n;
+      let withdrawalsGross = 0n;
+
+      // NEW: pour le verrou dépôt
+      let lastDepBlock = null;         // dernier bloc d'un dépôt de cet utilisateur
+      let hadWithdrawalAfter = false;  // un retrait a-t-il eu lieu après ce dépôt ?
+
+      for (const log of logs) {
+        let parsed;
+        try {
+          parsed = iface.parseLog(log);
+        } catch {
+          continue;
+        }
+
+        if (parsed?.name === "Deposited") {
+          const sender = parsed.args.sender;
+          const amt = parsed.args.amount;
+          if (toLower(sender) === toLower(addr)) {
+            deposits += amt;
+            myEvents.push({
+              type: "Deposited",
+              tx: log.transactionHash,
+              sender,
+              amount: ethers.formatUnits(amt, 18),
+            });
+
+            // track dernier bloc de dépôt pour cet utilisateur
+            if (lastDepBlock === null || log.blockNumber > lastDepBlock) {
+              lastDepBlock = log.blockNumber;
+              hadWithdrawalAfter = false; // on réinitialise: on ne sait pas encore s'il y a eu retrait après CE dépôt
+            }
+          }
+        } else if (parsed?.name === "Withdrawn") {
+          // On identifie l'appelant (withdrawer) via tx.from
+          const tx = await prov.getTransaction(log.transactionHash);
+          const caller = tx?.from || "";
+          if (toLower(caller) === toLower(addr)) {
+            const net = parsed.args.amount;
+            const fee = parsed.args.fee;
+            const gross = net + fee; // ce qui a réellement été déduit de ta balance
+            withdrawalsGross += gross;
+
+            myEvents.push({
+              type: "Withdrawn",
+              tx: log.transactionHash,
+              receiver: parsed.args.receiver,
+              amount: ethers.formatUnits(gross, 18),
+            });
+
+            // Si ce retrait est postérieur au dernier dépôt, on lève le verrou
+            if (lastDepBlock !== null && log.blockNumber > lastDepBlock) {
+              hadWithdrawalAfter = true;
+            }
+          }
+        }
+      }
+
+      // Balance dispo (brut) cumulée côté UI
+      let availableGross = deposits - withdrawalsGross;
+      if (availableGross < 0n) availableGross = 0n;
+
+      // Si on retire tout en 1 tx, le receveur touchera:
+      const feeAll = (availableGross * FEE_NUM) / FEE_DEN;
+      const maxNet = availableGross - feeAll;
+
+      setAvailableGrossStr(ethers.formatUnits(availableGross, 18));
+      setMaxWithdrawable(ethers.formatUnits(maxNet, 18));
+      setEvents(myEvents.reverse());
+
+      // NEW: règle "un seul dépôt puis retrait obligatoire avant nouveau dépôt"
+      if (lastDepBlock !== null && !hadWithdrawalAfter) {
+        setDepositLocked(true);
+        setDepositLockMsg("🔒 Deposit disabled: make a withdrawal before depositing again. Withdrawal available 24h after the last deposit ✅");
+      } else {
+        setDepositLocked(false);
+        setDepositLockMsg("");
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus("❌ Error while loading activity: " + err.message);
+    }
+  };
+
   const connect = async () => {
     try {
       const accs = await window.ethereum.request({ method: "eth_requestAccounts" });
-      const signer = await provider.getSigner();
+      const sgnr = await provider.getSigner();
       const network = await provider.getNetwork();
       if (network.chainId !== 1n) {
         setStatus("❌ Please connect to the Ethereum Mainnet");
         return;
       }
 
-      setSigner(signer);
+      setSigner(sgnr);
       setAddress(accs[0]);
       setStatus("✅ Wallet connected");
 
-      const prvx = new ethers.Contract(PRVX_ADDRESS, prvxAbi, signer);
+      const prvx = new ethers.Contract(PRVX_ADDRESS, prvxAbi, sgnr);
       const bal = await prvx.balanceOf(accs[0]);
       setBalance(ethers.formatUnits(bal, 18));
 
-      const mixer = new ethers.Contract(MIXER_ADDRESS, mixerAbi, signer);
-      const [rawAmount, timestamp] = await mixer.getDeposit(accs[0]);
+      // Logique 24h basée sur le dernier dépôt du contrat
+      const mixer = new ethers.Contract(MIXER_ADDRESS, mixerAbi, sgnr);
+      const [_, timestamp] = await mixer.getDeposit(accs[0]);
 
       if (timestamp > 0n) {
         const time = Number(timestamp);
         const depositDate = new Date(time * 1000);
         setDepositTime(depositDate.toLocaleString());
 
-        const fee = rawAmount * 10n / 10000n;
-        const net = rawAmount - fee;
-        setMaxWithdrawable(ethers.formatUnits(net, 18));
-
         const now = Math.floor(Date.now() / 1000);
         const diff = now - time;
 
         if (diff >= 86400) {
           setCanWithdraw(true);
+          setWithdrawCountdown("");
         } else {
           const remaining = 86400 - diff;
           const hours = Math.floor(remaining / 3600);
@@ -92,37 +198,14 @@ function App() {
           setWithdrawCountdown(`Available in ${hours}h ${minutes}m`);
           setCanWithdraw(false);
         }
+      } else {
+        setDepositTime(null);
+        setCanWithdraw(false);
+        setWithdrawCountdown("");
       }
 
-      const logs = await provider.getLogs({ fromBlock: "earliest", address: MIXER_ADDRESS });
-      const iface = new ethers.Interface(mixerAbi);
-      const parsed = logs.map(log => {
-        try {
-          const evt = iface.parseLog(log);
-          const base = {
-            type: evt.name,
-            tx: log.transactionHash
-          };
-          if (evt.name === "Deposited") {
-            return {
-              ...base,
-              sender: evt.args.sender,
-              amount: ethers.formatUnits(evt.args.amount, 18)
-            };
-          } else if (evt.name === "Withdrawn") {
-            return {
-              ...base,
-              receiver: evt.args.receiver,
-              amount: ethers.formatUnits(evt.args.amount + evt.args.fee, 18)
-            };
-          }
-          return null;
-        } catch {
-          return null;
-        }
-      }).filter(e => e);
-      setEvents(parsed.reverse());
-
+      // Historique filtré + calculs + verrou dépôt
+      await loadUserActivity(accs[0], provider);
     } catch (err) {
       console.error(err);
       setStatus("❌ Connection error: " + err.message);
@@ -131,7 +214,12 @@ function App() {
 
   const approveAndDeposit = async () => {
     try {
-      const amt = ethers.parseUnits(amount, 18);
+      if (depositLocked) {
+        setStatus("❌ Deposit blocked: make a withdrawal first.");
+        return;
+      }
+
+      const amt = ethers.parseUnits(amount || "0", 18);
       const prvx = new ethers.Contract(PRVX_ADDRESS, prvxAbi, signer);
       const mixer = new ethers.Contract(MIXER_ADDRESS, mixerAbi, signer);
 
@@ -144,7 +232,7 @@ function App() {
       await depositTx.wait();
 
       setStatus("✅ Deposit successful!");
-      connect();
+      await connect(); // refresh
     } catch (err) {
       console.error(err);
       setStatus("❌ Error: " + err.message);
@@ -156,7 +244,7 @@ function App() {
       const recipient = prompt("Withdrawal address:");
       if (!recipient) return;
 
-      const amt = ethers.parseUnits(amount, 18);
+      const amt = ethers.parseUnits(amount || "0", 18);
       const mixer = new ethers.Contract(MIXER_ADDRESS, mixerAbi, signer);
 
       setStatus("⏳ Withdrawing...");
@@ -164,6 +252,7 @@ function App() {
       await tx.wait();
 
       setStatus("✅ Withdrawal successful!");
+      await connect(); // refresh (déverrouille le dépôt)
     } catch (err) {
       console.error(err);
       setStatus("❌ Error: " + err.message);
@@ -173,12 +262,15 @@ function App() {
   const quickWithdraw = async () => {
     try {
       if (!quickAddress) return setStatus("❌ No quick address set");
-      const amt = ethers.parseUnits(amount, 18);
+      const amt = ethers.parseUnits(amount || "0", 18);
       const mixer = new ethers.Contract(MIXER_ADDRESS, mixerAbi, signer);
+
       setStatus("⏳ Quick withdrawing...");
       const tx = await mixer.withdraw(quickAddress, amt);
       await tx.wait();
+
       setStatus("✅ Quick withdrawal successful!");
+      await connect(); // refresh (déverrouille le dépôt)
     } catch (err) {
       console.error(err);
       setStatus("❌ Error: " + err.message);
@@ -223,24 +315,53 @@ function App() {
           <>
             <p>👤 Connected address: {address}</p>
             <p>💰 PRVX Balance: {balance}</p>
-            {depositTime && <p>🕒 Deposit recorded: {depositTime}</p>}
+            {depositTime && <p>🕒 Last deposit recorded: {depositTime}</p>}
             {quickAddress && <p>⚡ Quick address: {quickAddress}</p>}
-            {maxWithdrawable && <p>📤 Max withdrawable: {maxWithdrawable} PRVX (after 0.1% fee)</p>}
+
+            {/* Affichages clairs */}
+            {availableGrossStr && <p>🏦 Available balance (gross): {availableGrossStr} PRVX</p>}
+            {maxWithdrawable && <p>📤 Max you'll receive: {maxWithdrawable} PRVX (after 0.1% fee)</p>}
 
             <input
               type="text"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               placeholder="Amount of PRVX"
-              style={{ padding: "0.5rem", marginBottom: "1rem", width: "100%", maxWidth: "300px" }}
+              style={{ padding: "0.5rem", marginBottom: "0.5rem", width: "100%", maxWidth: "300px" }}
             />
 
-            <div style={{ marginTop: "1rem" }}>
-              <button onClick={approveAndDeposit} style={{ width: "100%", maxWidth: "300px" }}>📥 Approve + Deposit</button>
-              <button onClick={withdraw} disabled={!canWithdraw} style={{ width: "100%", maxWidth: "300px", marginTop: "1rem", opacity: canWithdraw ? 1 : 0.5 }} title={!canWithdraw ? withdrawCountdown : "Available"}>
+            {/* Message de verrou dépôt */}
+            {depositLocked && (
+              <p style={{ maxWidth: "600px", marginTop: 0 }}>
+                {depositLockMsg}
+              </p>
+            )}
+
+            <div style={{ marginTop: "0.5rem" }}>
+              <button
+                onClick={approveAndDeposit}
+                disabled={depositLocked}
+                style={{ width: "100%", maxWidth: "300px", opacity: depositLocked ? 0.5 : 1 }}
+                title={depositLocked ? "Make a withdrawal before depositing again" : "Approve and deposit"}
+              >
+                📥 Approve + Deposit
+              </button>
+
+              <button
+                onClick={withdraw}
+                disabled={!canWithdraw}
+                style={{ width: "100%", maxWidth: "300px", marginTop: "1rem", opacity: canWithdraw ? 1 : 0.5 }}
+                title={!canWithdraw ? withdrawCountdown : "Available to withdraw"}
+              >
                 📤 Withdraw
               </button>
-              <button onClick={quickWithdraw} disabled={!canWithdraw} style={{ width: "100%", maxWidth: "300px", marginTop: "1rem", opacity: canWithdraw ? 1 : 0.5 }} title={!canWithdraw ? withdrawCountdown : "Available"}>
+
+              <button
+                onClick={quickWithdraw}
+                disabled={!canWithdraw}
+                style={{ width: "100%", maxWidth: "300px", marginTop: "1rem", opacity: canWithdraw ? 1 : 0.5 }}
+                title={!canWithdraw ? withdrawCountdown : "Available to withdraw"}
+              >
                 ⚡ Quick Withdraw
               </button>
             </div>
@@ -249,10 +370,13 @@ function App() {
               ⚙️ Set quick withdraw address
             </button>
 
-            <h3 style={{ marginTop: "2rem" }}>📜 History</h3>
+            {/* Titre mis à jour */}
+            <h3 style={{ marginTop: "2rem" }}>📜 My History</h3>
             <ul>
               {events.map((e, i) => (
-                <li key={i}>[{e.type}] {e.amount} PRVX - {(e.sender || e.receiver).slice(0, 6)}... @ tx {e.tx.slice(0, 10)}</li>
+                <li key={i}>
+                  [{e.type}] {e.amount} PRVX - {(e.sender || e.receiver || "").slice(0, 6)}... @ tx {e.tx.slice(0, 10)}
+                </li>
               ))}
             </ul>
           </>
